@@ -8,12 +8,13 @@ const MY_FOLLOWS_CSV = `${DATA_DIR}/my-follows-enriched.csv`;
 const CSV_OUT = `${DATA_DIR}/follow-worthy-scored.csv`;
 const STATE_FILE = `${STATE_DIR}/phase6-llm.json`;
 
-const LLM_KEY = process.env.LLM_API_KEY || process.env.DEEPSEEK_API_KEY;
-const LLM_BASE = process.env.LLM_BASE_URL || 'https://api.deepseek.com';
-const LLM_MODEL = process.env.LLM_MODEL || 'deepseek-chat';
+const LLM_KEY = process.env.LLM_API_KEY;
+const LLM_BASE = process.env.LLM_BASE_URL;
+const LLM_MODEL = process.env.LLM_MODEL;
+const BATCH_SIZE = 20;
 
 if (!LLM_KEY) {
-  console.error('  Set LLM_API_KEY or DEEPSEEK_API_KEY in .env');
+  console.error('Set LLM_API_KEY in .env');
   process.exit(1);
 }
 
@@ -31,8 +32,8 @@ function parseCSV(filename) {
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function callLLM(messages) {
-  const res = await fetch(`${LLM_BASE}/v1/chat/completions`, {
+async function callLLM(prompt) {
+  const res = await fetch(`${LLM_BASE}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -40,115 +41,112 @@ async function callLLM(messages) {
     },
     body: JSON.stringify({
       model: LLM_MODEL,
-      messages,
+      messages: [
+        { role: 'system', content: 'Classify X/Twitter accounts for trading relevance. Return valid JSON array only.' },
+        { role: 'user', content: prompt },
+      ],
       temperature: 0.3,
-      max_tokens: 300,
+      max_tokens: BATCH_SIZE * 80,
     }),
   });
 
   const json = await res.json();
-  if (!res.ok) throw new Error(`${res.status} ${JSON.stringify(json)}`);
+  if (!res.ok) throw new Error(`${res.status} ${JSON.stringify(json.error || json)}`);
   return json.choices?.[0]?.message?.content || '';
-}
-
-async function classifyHandle(handle, bio, tweets) {
-  const sample = tweets.slice(0, 15).map((t, i) => `  ${i + 1}. [${t.is_retweet === 'yes' ? 'RT' : 'TW'} ${t.like_count}❤] ${t.text.slice(0, 200)}`).join('\n');
-
-  const prompt = `Analyze this X/Twitter account for trading relevance.
-
-Bio: ${bio}
-Recent posts:
-${sample}
-
-Respond in JSON only:
-{
-  "primary_topic": "US Equities|Indian Equities|Options/Volatility|Crypto|Macro/Rates|Futures/Commodities|Quant/Systematic|AI/Coding for Traders|Finance News|General Business|Personal/Lifestyle",
-  "secondary_topic": "one of the above or none",
-  "trading_signal_density": 1-10 (how many tweets are directly trading-relevant vs noise),
-  "post_style": "one-sentence summary of posting style",
-  "is_aggregator": true/false,
-  "is_dormant": true/false,
-  "quality_score": 1-10
-}`;
-
-  const result = await callLLM([
-    { role: 'system', content: 'You analyze X/Twitter accounts for trading relevance. Respond with valid JSON only.' },
-    { role: 'user', content: prompt },
-  ]);
-
-  try {
-    const cleaned = result.replace(/```json\n?/g, '').replace(/```/g, '').trim();
-    return JSON.parse(cleaned);
-  } catch {
-    return { primary_topic: 'unknown', trading_signal_density: 1, post_style: 'no data', quality_score: 1 };
-  }
 }
 
 (async () => {
   console.log('[Phase 6] LLM classification + scoring...');
-  console.log(`  Provider: ${LLM_BASE} | Model: ${LLM_MODEL}`);
+  console.log(`  Provider: OpenRouter | Model: ${LLM_MODEL} | Batch: ${BATCH_SIZE}`);
+  console.log(`  Est: ~${Math.ceil(1289 / BATCH_SIZE)} calls × ~2s = ~${(Math.ceil(1289 / BATCH_SIZE) * 2 / 60).toFixed(1)}m\n`);
 
-  if (!fs.existsSync(POSTS_CSV)) {
-    console.error(`  Missing ${POSTS_CSV}. Run phase 5 first.`);
-    process.exit(1);
-  }
-
-  // Load data
   const posts = parseCSV(POSTS_CSV);
   const worthy = parseCSV(WORTHY_CSV);
 
-  // Build my-follows set
   const myFollows = new Set();
   if (fs.existsSync(MY_FOLLOWS_CSV)) {
     for (const f of parseCSV(MY_FOLLOWS_CSV)) myFollows.add(f.handle);
   }
 
-  // Group posts by handle
   const postsByHandle = {};
   for (const p of posts) {
     if (!postsByHandle[p.handle]) postsByHandle[p.handle] = [];
     postsByHandle[p.handle].push(p);
   }
 
-  // Build worthy lookup
   const worthyMap = {};
   for (const w of worthy) worthyMap[w.handle] = w;
 
   const handles = Object.keys(postsByHandle);
   console.log(`  ${handles.length} handles to classify.`);
 
-  const progress = loadJSON(STATE_FILE) || { done: [], classifications: {} };
+  const progress = loadJSON(STATE_FILE) || { done: [], classifications: {}, batches: 0 };
   const pending = handles.filter(h => !progress.classifications[h]);
 
-  console.log(`  Already classified: ${Object.keys(progress.classifications).length}, remaining: ${pending.length}.`);
+  console.log(`  Already: ${Object.keys(progress.classifications).length}, remaining: ${pending.length}.`);
+  if (pending.length === 0) {
+    console.log('  All classified. Skipping to scoring...');
+  } else {
+    for (let i = 0; i < pending.length; i += BATCH_SIZE) {
+      const batch = pending.slice(i, i + BATCH_SIZE);
+      const batchNum = progress.batches + 1;
+      const start = Date.now();
 
-  // Classify in batches with delay
-  for (let i = 0; i < pending.length; i++) {
-    const handle = pending[i];
-    const w = worthyMap[handle] || {};
-    const tweets = postsByHandle[handle] || [];
+      process.stdout.write(`  Batch ${batchNum} [${i + 1}-${Math.min(i + BATCH_SIZE, pending.length)}/${pending.length}] `);
 
-    process.stdout.write(`  [${progress.done.length + 1}/${handles.length}] @${handle} (${tweets.length} posts) `);
+      const batchData = batch.map((handle, idx) =>
+        `[${idx}]\nhandle: ${handle}\nbio: ${(worthyMap[handle]?.bio || '').replace(/\n/g, ' ').slice(0, 150)}\nsample: ${(postsByHandle[handle] || []).slice(0, 8).map((t, ti) => {
+          const prefix = t.is_retweet === 'yes' ? 'RT:' : '';
+          return `${ti + 1}. ${prefix}${(t.text || '').replace(/\n/g, ' ').slice(0, 150)} [${t.like_count}❤]`;
+        }).join(' | ')}`
+      ).join('\n\n');
 
-    try {
-      const result = await classifyHandle(handle, w.bio || '', tweets);
-      progress.classifications[handle] = result;
-      console.log(`→ ${result.primary_topic} density:${result.trading_signal_density}`);
-    } catch (e) {
-      console.log(`error: ${e.message}`);
-      progress.classifications[handle] = {
-        primary_topic: 'error',
-        trading_signal_density: 1,
-        post_style: 'error',
-        quality_score: 1,
-      };
+      const prompt = `Classify each [N] account for trading relevance. Return JSON array, one object per account, in order.
+
+${batchData}
+
+Return ONLY: [{"handle":"...","primary_topic":"US Equities|Indian Equities|Options/Volatility|Crypto|Macro/Rates|Futures/Commodities|Quant/Systematic|AI/Coding for Traders|Finance News|General Business|Personal/Lifestyle","trading_signal_density":1-10,"post_style":"one sentence summary","is_aggregator":true/false,"is_dormant":true/false,"quality_score":1-10}]`;
+
+      try {
+        const result = await callLLM(prompt);
+        const cleaned = result.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+        let parsed;
+        try { parsed = JSON.parse(cleaned); } catch {
+          const match = cleaned.match(/\[.*\]/s);
+          parsed = match ? JSON.parse(match[0]) : [];
+        }
+
+        let matched = 0;
+        for (const item of (Array.isArray(parsed) ? parsed : [])) {
+          if (item.handle && progress.classifications[item.handle] === undefined) {
+            progress.classifications[item.handle] = item;
+            matched++;
+          }
+        }
+        for (const h of batch) {
+          if (!progress.classifications[h]) {
+            progress.classifications[h] = { primary_topic: 'unknown', trading_signal_density: 1, post_style: 'parse error', is_aggregator: false, is_dormant: false, quality_score: 1 };
+          }
+          if (!progress.done.includes(h)) progress.done.push(h);
+        }
+
+        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+        console.log(`✓ ${matched}/${batch.length} [${elapsed}s]`);
+
+      } catch (e) {
+        console.log(`✗ ${e.message.slice(0, 60)}`);
+        for (const h of batch) {
+          if (!progress.classifications[h]) {
+            progress.classifications[h] = { primary_topic: 'error', trading_signal_density: 1, post_style: 'api error', is_aggregator: false, is_dormant: false, quality_score: 1 };
+          }
+          if (!progress.done.includes(h)) progress.done.push(h);
+        }
+      }
+
+      progress.batches = batchNum;
+      saveJSON(STATE_FILE, progress);
+      await delay(200);
     }
-
-    progress.done.push(handle);
-    saveJSON(STATE_FILE, progress);
-
-    if (i % 25 === 0) await delay(1000);
-    else await delay(300);
   }
 
   // === Scoring ===
@@ -162,60 +160,35 @@ Respond in JSON only:
       const followers = parseInt(w.followers) || 0;
       const verified = w.verified === 'yes';
 
-      // Endorsement score (0-30): how many of your follows follow them
-      const E = Math.min(30, endorsed * 1.5);
-
-      // Trading relevance (0-24): from classification
       const tradingTopics = [
         'US Equities', 'Indian Equities', 'Options/Volatility', 'Crypto',
         'Macro/Rates', 'Futures/Commodities', 'Quant/Systematic',
         'AI/Coding for Traders', 'Finance News',
       ];
       const isTrading = tradingTopics.includes(c.primary_topic || '');
+
+      const E = Math.min(30, endorsed * 1.5);
       const T = isTrading ? Math.min(24, (c.trading_signal_density || 1) * 2.4) : 0;
-
-      // Signal density (0-14): how many tweets are trading-relevant
       const S = Math.min(14, (c.trading_signal_density || 1) * 1.4);
-
-      // Specialization (0-10): narrower topic focus = higher
       const Q = (c.primary_topic && c.primary_topic !== 'Personal/Lifestyle' && c.primary_topic !== 'General Business') ? 7 : 3;
-
-      // Credibility (0-8)
       const C = verified ? 8 : (followers > 10000 ? 5 : 2);
-
-      // Activity quality (0-6)
       const A = (c.is_dormant ? 1 : 4) + (c.is_aggregator ? -2 : 2);
-
-      // Fit score (0-8): how well they match a retail trader
       const F = 4;
-
-      // Penalty (0-20)
       const P = (c.is_aggregator ? 10 : 0) + (c.is_dormant ? 10 : 0);
-
       const score = Math.max(0, Math.min(100, E + T + S + Q + C + A + F - P));
 
       return {
-        id: w.id,
-        handle: w.handle,
-        name: w.name,
-        bio: w.bio,
-        followers: w.followers,
-        endorsed_by_count: w.followed_by_count,
-        verified: w.verified,
-        primary_topic: c.primary_topic || '',
-        secondary_topic: c.secondary_topic || '',
+        id: w.id, handle: w.handle, name: w.name, bio: w.bio,
+        followers: w.followers, endorsed_by_count: w.followed_by_count, verified: w.verified,
+        primary_topic: c.primary_topic || '', secondary_topic: c.secondary_topic || '',
         trading_signal_density: c.trading_signal_density || 1,
         post_style: c.post_style || '',
         is_aggregator: c.is_aggregator ? 'yes' : 'no',
         is_dormant: c.is_dormant ? 'yes' : 'no',
-        endorsement_score: Math.round(E),
-        trading_relevance: Math.round(T),
-        signal_density: Math.round(S),
-        specialization: Math.round(Q),
-        credibility: Math.round(C),
-        activity_quality: Math.round(A),
-        fit_score: Math.round(F),
-        penalty: Math.round(P),
+        endorsement_score: Math.round(E), trading_relevance: Math.round(T),
+        signal_density: Math.round(S), specialization: Math.round(Q),
+        credibility: Math.round(C), activity_quality: Math.round(A),
+        fit_score: Math.round(F), penalty: Math.round(P),
         total_score: Math.round(score),
         already_followed: myFollows.has(w.handle) ? 'yes' : 'no',
         why_follow: `${c.post_style || ''}. ${c.primary_topic || ''} focus. Endorsed by ${endorsed} of your follows.`,
@@ -245,6 +218,7 @@ Respond in JSON only:
 
   console.log(`\n  ✅ Phase 6 done. ${scoredRows.length} handles scored.`);
   console.log(`     Output: ${CSV_OUT}`);
+  console.log(`     Batches: ${progress.batches}`);
 
   console.log('\n  Top 25:');
   scoredRows.slice(0, 25).forEach((r, i) => {
