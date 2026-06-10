@@ -119,7 +119,8 @@ function parseCSV(filename) {
   });
 
   const headers = ['id', 'handle', 'name', 'bio', 'followers', 'following', 'tweets', 'verified', 'joined', 'followed_by_count', 'followed_by'];
-  saveCSV(CSV_OUT, rows, headers);
+  const csvRows = rows.map(r => [r.id, r.handle, r.name, r.bio, r.followers, r.following, r.tweets, r.verified, r.joined, r.followed_by_count, r.followed_by]);
+  saveCSV(CSV_OUT, csvRows, headers);
 
   console.log(`\n  Done! ${rows.length} handles ranked.`);
   console.log(`  Total credits used: ${progress.totalCreditsUsed}`);

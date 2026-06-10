@@ -27,6 +27,11 @@ case $MODE in
     echo "► Phase 4: Enrich all profiles + rank (no account needed)"
     node src/phase4-enrich.js
     ;;
+  phase5)
+    echo "► Phase 5: Post sampling via xfetch (no account needed)"
+    echo "   Resumes on 402. Top up and re-run until complete."
+    node src/phase5-posts.js
+    ;;
   all)
     echo "► Phase 1: Scrape handles"
     node src/phase1-xfetch.js
