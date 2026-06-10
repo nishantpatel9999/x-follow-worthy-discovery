@@ -4,3 +4,4 @@ state/
 data/
 *.DS_Store
 *.log
+scweet_state.db
